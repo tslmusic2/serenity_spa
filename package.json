@@ -1,0 +1,24 @@
+{
+  "name": "serenity_spa",
+  "version": "1.0.0",
+  "description": "A full service spa offering massage packages",
+  "homepage": "https://github.com/tslmusic2/serenity_spa#readme",
+  "bugs": {
+    "url": "https://github.com/tslmusic2/serenity_spa/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tslmusic2/serenity_spa.git"
+  },
+  "license": "ISC",
+  "author": "tslmusic2",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node --env-file=.env server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
+}
