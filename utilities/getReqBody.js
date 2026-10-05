@@ -1,4 +1,4 @@
-export async function getRequestBody(req) {
+export async function getReqBody(req) {
 
     let body = ''
 
