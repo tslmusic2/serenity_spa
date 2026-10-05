@@ -198,13 +198,18 @@ console.log('Incoming request:', req.method, req.url)
         }
 
 
-        if (req.url === '/api/packages' && req.method === 'PATCH') {
+        if (req.url.startsWith('/api/packages') && req.method === 'PATCH') {
 
              //----------------------------------------------------------//
 			if (!ADMIN_API_KEY || req.headers['x-admin-key'] !== ADMIN_API_KEY) {
 				return sendJson(res, 403, { message: 'Admin access required' })
 			}
 			//----------------------------------------------------------//
+
+            const id = Number(req.url.split('/').pop())
+            if (!Number.isInteger(id) || id < 1 || id > 2147483647) {
+                return sendJson(res, 400, {message: 'id must be an integer between 1 to 2147483647'})
+            }
 
 
             let parsedReqBody
@@ -228,9 +233,186 @@ console.log('Incoming request:', req.method, req.url)
 
 
 
+            const parsedReqArr = Object.keys(parsedReqBody)
+            if (parsedReqArr.length === 0) {
+                return sendJson(res, 400, {message: 'Provide at least one field to update'})
+            }
+
+            const allowedFields = ['package_name', 'duration_minutes', 'description', 'price', 'max_daily_bookings', 'is_active']
+
+            for (const field of parsedReqArr) {
+                const hasField = allowedFields.includes(field)
+                if(!hasField) {
+                    return sendJson(res, 400, {message: 'Request contains an invalid field'})
+                }
+            }
+
+
+             //package_name, 
+            const hasOwnPackageName = Object.hasOwn(parsedReqBody, 'package_name')
+            if(hasOwnPackageName) {
+                if(
+                    parsedReqBody.package_name === null || 
+                    typeof parsedReqBody.package_name !== 'string' ||
+                    parsedReqBody.package_name.trim().length === 0
+                ) {
+                    return sendJson(res, 400, {message: 'package_name must be a non empty string'})
+                }
+            }
+
+            // duration_minutes, 
+            const hasOwnDurationMinutes = Object.hasOwn(parsedReqBody, 'duration_minutes')
+            if(hasOwnDurationMinutes) {
+                if (
+                    parsedReqBody.duration_minutes === null ||
+                    !Number.isInteger(parsedReqBody.duration_minutes) ||
+                    parsedReqBody.duration_minutes < 1 ||
+                    parsedReqBody.duration_minutes > 600
+                ) {
+                    return sendJson(res, 400, {message: 'duration_minutes must be an integer between 1 and 600'})
+                }
+            }
+
+
+            //description, 
+            const hasOwnDescription = Object.hasOwn(parsedReqBody, 'description')
+            if(hasOwnDescription) {
+                if(
+                    parsedReqBody.description === null || 
+                    typeof parsedReqBody.description !== 'string' ||
+                    parsedReqBody.description.trim().length === 0
+                ) {
+                    return sendJson(res, 400, {message: 'description must be a non empty string'})
+                }
+            }
+
+            //price, 
+            const hasOwnPrice = Object.hasOwn(parsedReqBody, 'price')
+            if(hasOwnPrice) {
+                if (
+                    parsedReqBody.price === null ||
+                    !Number.isFinite(parsedReqBody.price) ||
+                    parsedReqBody.price < 0 ||
+                    parsedReqBody.price > 99999999.99
+                ) {
+                    return sendJson(res, 400, {message: 'price must be a number between 0 and 99999999.99'})
+                }
+            }
+            
+            //max_daily_bookings,
+            const hasOwnMaxBookings = Object.hasOwn(parsedReqBody, 'max_daily_bookings')
+            if(hasOwnMaxBookings) {
+                if (
+                parsedReqBody.max_daily_bookings !== null &&
+                (!Number.isInteger(parsedReqBody.max_daily_bookings) ||
+                parsedReqBody.max_daily_bookings < 1 ||
+                parsedReqBody.max_daily_bookings > 2147483647)
+                ) {
+                    return sendJson(res, 400, {message: 'max_daily_bookings must be a number between 1 and 2147483647 or null'})
+                }
+            }
+
+            //is_active
+            const hasOwnIsActive = Object.hasOwn(parsedReqBody, 'is_active')
+            if(hasOwnIsActive) {
+                if (parsedReqBody.is_active === null || typeof parsedReqBody.is_active !== 'boolean') {
+                    return sendJson(res, 400, {message: 'is_active must be true or false'})
+                }
+            }
+
+            const setFields = parsedReqArr.map((field, index) => 
+                `${field} = $${index + 1}`
+            )
+
+            const idPlaceholder = `$${setFields.length + 1}`
+
+            const values = Object.values(parsedReqBody)
+            values.push(id)
+
+            const result = await pool.query(`
+                UPDATE packages
+                SET ${setFields.join(', ')}
+                WHERE id = ${idPlaceholder}  
+                RETURNING * 
+                `, values)
+
+            if (result.rowCount === 0) {
+                return sendJson(res, 404, {message: 'Package could not be found'})
+            }
+
+            return sendJson(res, 200, {message: 'Package successfully updated', package: result.rows})
+
+
         }
 
 
+        if (req.url.startsWith('/api/packages') && req.method === 'DELETE') {
+
+            //----------------------------------------------------------//
+			if (!ADMIN_API_KEY || req.headers['x-admin-key'] !== ADMIN_API_KEY) {
+				return sendJson(res, 403, { message: 'Admin access required' })
+			}
+			//----------------------------------------------------------//
+
+            const id = Number(req.url.split('/').pop())
+
+            if (!Number.isInteger(id) || id < 1 || id > 2147483647) {
+                return sendJson(res, 400, {message: 'id must be an integer between 1 to 2147483647'})
+            }
+
+
+            let result
+            try {
+                result = await pool.query(`
+                    DELETE FROM packages
+                        WHERE id = $1
+                    RETURNING *;
+                    `, [id])
+
+            } catch (err) {
+				if (err.code === '23503') {
+					return sendJson(res, 409, {
+                        message: 'This package is referenced by a reservation and cannot be deleted. Please deaqctivate it instead'})
+				}
+
+				throw err
+			}
+
+            if (result.rowCount === 0) {
+                return sendJson(res, 404, {message: 'Package could not be found'})
+            }
+
+            return sendJson(res, 200, {message: 'Package successfully deleted', package: result.rows[0]})
+
+        }
+
+
+
+    //-----------------POST RESERVATIONS HANDLER-------------------------
+    if (req.url === 'api/reservations' && req.method === 'POST') {
+
+        let parsedReqBody
+        try {
+
+            parsedReqBody = await getReqBody(req)
+
+                if (parsedReqBody === null || typeof parsedReqBody !== 'object' || Array.isArray(parsedReqBody)) {
+                    return sendJson(res, 400, {message: 'Request must be a valid JSON object'})
+                }
+
+        } catch(err) {
+
+                if(err instanceof SyntaxError) {
+                    return sendJson(res, 400, {message: 'Request body must contain valid JSON'})
+                }
+
+                    throw err
+            }
+
+            
+
+
+    }
 
 
         return sendJson(res, 404, {message: 'URL could not be found'})
