@@ -2,6 +2,7 @@ import http from 'node:http'
 import { pool } from './utilities/database.js'
 import { sendJson } from './utilities/responses.js'
 import { getReqBody } from './utilities/getReqBody.js'
+import { isValidISODate } from './utilities/isValidIsoDate.js'
 
 
 
@@ -389,7 +390,7 @@ console.log('Incoming request:', req.method, req.url)
 
 
     //-----------------POST RESERVATIONS HANDLER-------------------------
-    if (req.url === 'api/reservations' && req.method === 'POST') {
+    if (req.url === '/api/reservations' && req.method === 'POST') {
 
         let parsedReqBody
         try {
@@ -409,7 +410,268 @@ console.log('Incoming request:', req.method, req.url)
                     throw err
             }
 
+
+            const requiredFields = ['full_name', 'email', 'phone', 'package_id', 'appointment_date', 'appointment_time']
+                //server controlled fields     booking_price, booking_duration_minutes, status, or either generated ID
+
+
+            const parsedReqArr = Object.keys(parsedReqBody)
+            for (const field of requiredFields) {
+                if (!parsedReqArr.includes(field)) {
+                    return sendJson(res, 400, {message: `${field} is a required field`})
+                }
+            }
+
+            for (const field of parsedReqArr) {
+                if (!requiredFields.includes(field)) {
+                    return sendJson(res, 400, {message: `${field} is not an allowed field`})
+                }
+            }
+
+
+            //full_name, // email, // phone, 
+            const stringFields = ['full_name', 'email', 'phone']
+
+            for (const field of stringFields) {
+                const value = parsedReqBody[field]
+                if (
+                    value === null || 
+                    typeof value !== 'string' ||
+                    value.trim().length === 0
+                ) {
+                    return sendJson(res, 400, {message: `${field} must be a non empty string`})
+                }
+                parsedReqBody[field] = value.trim()
+            }
+
+            //----Checks the email pattern is valid
+            const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+            if (!emailPattern.test(parsedReqBody.email)) {
+                return sendJson(res, 400, {
+                    message: 'email must use a format like name@example.com'
+                })
+            }
+
+            //----Checks the phone pattern is valid
+            const phone = parsedReqBody.phone
+            const phonePattern = /^\+?[0-9() .-]+$/
+            const phoneDigits = phone.replace(/\D/g, '')
+
+            if (
+                !phonePattern.test(phone) ||
+                phoneDigits.length < 7 ||
+                phoneDigits.length > 15
+            ) {
+                return sendJson(res, 400, {
+                    message: 'phone must contain 7–15 digits and use only an optional leading +, spaces, parentheses, dots, or hyphens'
+                })
+            }
+
+
+            // package_id, 
+            if (
+                parsedReqBody.package_id === null ||
+                !Number.isInteger(parsedReqBody.package_id) ||
+                parsedReqBody.package_id < 1 ||
+                parsedReqBody.package_id > 2147483647
+            ) {
+                return sendJson(res, 400, {message: 'package_id must be a number between 1 and 2147483647'})
+            }
+
+            // appointment_date, 
+            if (!isValidISODate(parsedReqBody.appointment_date)) {
+                return sendJson(res, 400, {message: `appointment_date must be a valid date`})
+            }
+
+            // appointment_time
+            if (
+                typeof parsedReqBody.appointment_time !== 'string' ||
+                !/^([01]\d|2[0-3]):[0-5]\d$/.test(parsedReqBody.appointment_time
+                )
+            ) {
+                return sendJson(res, 400, {message: 'appointment_time must use HH:MM format from 00:00 to 23:59'})
+            }
             
+            //time must be between 9 and 18:00   but 17:00 for 2hr packages  and 14:00 for 5hr packages
+            const [hours, min] = parsedReqBody.appointment_time.split(':').map(Number)
+            if(hours < 9 || hours > 18) {
+                return sendJson(res, 400, {message: 'appointment_time must be between 9:00(9am) and 18:00(6pm)'})
+            }
+            if (min !== 0) {
+                return sendJson(res, 400, {message: 'appointment_time mimutes must be on the hour(:00)'})
+            }
+
+            
+            
+
+    
+            
+
+        //-----------------APPOINTMENT TRY/CATCH and CREATION---------------------------
+            const client = await pool.connect()
+            try {
+
+                await client.query('BEGIN')
+
+                await client.query(`
+                    SELECT pg_advisory_xact_lock(
+                        1,
+                        $1::date - DATE '2000-01-01'
+                    );
+                    `, [parsedReqBody.appointment_date])
+
+
+                const packageValues = [parsedReqBody.package_id, true]
+                
+                const result = await client.query(`
+                    SELECT id, price, duration_minutes, max_daily_bookings FROM packages
+                    WHERE id = $1
+                    AND is_active = $2
+                    FOR SHARE;
+                    `, packageValues)
+
+                if(result.rowCount === 0) {
+                    await client.query('ROLLBACK')
+                    return sendJson(res, 404, {message: 'package doesnt exist or is inactive'})
+                }
+
+                //checks appointment will end before close
+                const selectedPackage = result.rows[0]
+                if (hours * 60 + selectedPackage.duration_minutes > 19 * 60) {
+                    await client.query('ROLLBACK')
+                    return sendJson(res, 400, {message: 'appointment would finish after close.  appointment must finish by 19:00'})
+                }
+
+                //checks date is in the future
+                const futureResult = await client.query(`
+                    SELECT 
+                    ($1::date + $2::time) >
+                    (clock_timestamp()AT TIME ZONE 'America/Costa_Rica') AS is_future;
+                    `, [parsedReqBody.appointment_date, parsedReqBody.appointment_time])
+            
+                if (!futureResult.rows[0].is_future) {
+                    await client.query('ROLLBACK')
+                    return sendJson(res, 400, {message: 'Appointment must start in the future in Costa Rica time'})
+                }
+
+                
+                //counting this package’s non-cancelled reservations on the requested date and comparing that count with max_daily_bookings
+                const resCountCheckValues = [parsedReqBody.appointment_date, selectedPackage.id, 'cancelled']
+                const reservationCount = await client.query(`
+                        SELECT id FROM reservations
+                            WHERE appointment_date = $1
+                            AND package_id = $2
+                            AND status != ($3)
+                    `, resCountCheckValues)
+
+                if (selectedPackage.max_daily_bookings !== null && reservationCount.rowCount >= selectedPackage.max_daily_bookings) {
+                    await client.query('ROLLBACK')
+                    return sendJson(res, 409, {message: 'There are no more appointments available on the requested date for your requested package'})     
+                }
+
+ //----------------               //Check overlapping appointments
+                const appointmentCount = await client.query(`
+                        SELECT id, appointment_time, booking_duration_minutes FROM reservations
+                            WHERE appointment_date = $1
+                            AND status != ($2)
+                    `, [parsedReqBody.appointment_date, 'cancelled'])
+
+                const existingReservations = appointmentCount.rows
+
+                const reservationTimes = []
+                for (const reservation of existingReservations) {
+                    const [hours,minutes] = reservation.appointment_time.split(':').map(Number)
+                    const startTime = hours * 60 + minutes
+                    const endTime = startTime + reservation.booking_duration_minutes
+
+                    reservationTimes.push({startTime, endTime})
+
+                }
+
+                const newReservationStart = hours * 60 + min
+                const newReservationEnd = newReservationStart + selectedPackage.duration_minutes
+
+                for(let minute = newReservationStart; minute < newReservationEnd; minute++) {
+                    let activeCount = 0
+                    for (const reservation of reservationTimes) {
+                        if (reservation.startTime <= minute && minute < reservation.endTime)
+                            activeCount += 1
+                    }
+
+                    if(activeCount >= 4) {
+                        await client.query('ROLLBACK')
+                        return sendJson(res, 409, {message: 'There are no more appointments available for this time frame'})
+                    }
+                }
+
+//--------------
+
+
+
+
+
+
+                const email = parsedReqBody.email.trim().toLowerCase()
+
+                const customerResult = await client.query(`
+                    INSERT INTO customers (
+                        full_name, email, phone
+                    ) VALUES (
+                        $1, $2, $3
+                    )
+                    ON CONFLICT (email) DO NOTHING
+                    RETURNING id;
+                `, [
+                    parsedReqBody.full_name,
+                    email,
+                    parsedReqBody.phone
+                    ])
+
+                let customerInfo = customerResult.rows[0]
+
+                if (!customerInfo) {
+                    const existingCustomerResult = await client.query(`
+                        SELECT id
+                        FROM customers
+                        WHERE email = $1;
+                    `, [email])
+
+                    customerInfo = existingCustomerResult.rows[0]
+                }
+
+
+
+                //needed fields    customer_id, appointment_date, appointment_time, package_id, booking_price
+                const reservationValues = [
+                    customerInfo.id, 
+                    parsedReqBody.appointment_date, 
+                    parsedReqBody.appointment_time,
+                    parsedReqBody.package_id,
+                    selectedPackage.price,
+                    selectedPackage.duration_minutes
+                ]
+
+                //save reservation
+                const newReservation = await client.query(`
+                    INSERT INTO reservations (
+                        customer_id, appointment_date, appointment_time, package_id, booking_price, booking_duration_minutes
+                    ) VALUES (
+                     $1, $2, $3, $4, $5, $6
+                    )
+                     RETURNING *;
+                    `, reservationValues)
+
+
+                await client.query('COMMIT')
+
+                return sendJson(res, 201, {message: 'Reservation was made successfully', reservation: newReservation.rows[0]})
+
+            } catch (err) {
+                await client.query('ROLLBACK')
+                throw err
+            } finally {
+                client.release()
+            }
 
 
     }
